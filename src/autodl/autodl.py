@@ -246,10 +246,10 @@ class AutoDL:
         predictions = self.model.predict(X_transformed, verbose=0)
         
         # For binary classification, threshold at 0.5
-        if self.task_type == "classification" and predictions.shape[1] == 1:
+        if self.task_type == "classification" and predictions.ndim > 1 and predictions.shape[1] == 1:
             predictions = (predictions > 0.5).astype(int)
         # For multi-class classification, take argmax
-        elif self.task_type == "classification":
+        elif self.task_type == "classification" and predictions.ndim > 1:
             predictions = np.argmax(predictions, axis=1)
         
         return predictions

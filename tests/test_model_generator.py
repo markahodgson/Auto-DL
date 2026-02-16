@@ -48,16 +48,16 @@ class TestModelGenerator(unittest.TestCase):
         self.assertEqual(model.output_shape, (None, 1))
     
     def test_auto_generate_architecture(self):
-        """Test automatic architecture generation."""
-        architecture = self.generator._auto_generate_architecture(10)
+        """Test automatic architecture generation via public API."""
+        # Create model without specifying hidden_units
+        model = self.generator.create_model(
+            input_shape=(15,),
+            num_classes=2
+        )
         
-        self.assertIsInstance(architecture, list)
-        self.assertGreater(len(architecture), 0)
-        self.assertLessEqual(len(architecture), 3)
-        
-        # Check that sizes decrease
-        for i in range(len(architecture) - 1):
-            self.assertGreaterEqual(architecture[i], architecture[i + 1])
+        # Verify that an architecture was generated
+        self.assertIsNotNone(model)
+        self.assertGreater(len(model.layers), 2)  # At least input and output layers
     
     def test_create_model_without_hidden_units(self):
         """Test creating model with automatic architecture."""

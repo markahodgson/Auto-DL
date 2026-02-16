@@ -77,9 +77,12 @@ class HyperparameterOptimizer:
         if self.search_method == "random":
             params = {}
             for key, values in search_space.items():
-                params[key] = np.random.choice(values) if isinstance(values[0], (int, float, str)) else np.random.choice(len(values))
                 if key == "hidden_units":
-                    params[key] = values[params[key]]
+                    # Special handling for nested list structure
+                    params[key] = values[np.random.choice(len(values))]
+                else:
+                    # Standard handling for primitive values
+                    params[key] = np.random.choice(values)
             return params
         else:
             raise NotImplementedError(f"Search method {self.search_method} not implemented")
