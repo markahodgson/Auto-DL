@@ -13,7 +13,7 @@ Local-first AutoDL scaffolding for wide/sparse tabular data with optional text f
 - Data profiling: numeric/categorical/text detection, missing rate, skew, sparse estimate
 - Preprocessing: NaN handling, normalization, categorical one-hot, text backend routing, passthrough columns
 - Intermediate output: `preprocessed.parquet`
-- Training command scaffold with staged sampling metadata (ready for TensorFlow+Optuna integration)
+- Training: staged TensorFlow + Optuna pipeline (sampled tuning, finalist retraining, best model export)
 
 ## Local-first defaults
 - Tracking defaults to local artifacts (`tracking.backend: local`)
@@ -37,7 +37,7 @@ Local-first AutoDL scaffolding for wide/sparse tabular data with optional text f
 
 	`autodl preprocess --data data/train.csv --target label --config config.yaml`
 
-5. Run training scaffold on preprocessed data:
+5. Run training on preprocessed data:
 
 	`autodl train --parquet runs/<prep_run_id>/preprocessed.parquet --target label --config config.yaml`
 
@@ -46,7 +46,10 @@ Local-first AutoDL scaffolding for wide/sparse tabular data with optional text f
 - `runs/<run_id>/profile.json` (profile stage)
 - `runs/<run_id>/preprocessed.parquet` (preprocess stage)
 - `runs/<run_id>/preprocess_metadata.json`
-- `runs/<run_id>/metrics_summary.json` (train stage scaffold)
+- `runs/<run_id>/metrics_summary.json` (train metrics)
+- `runs/<run_id>/optuna_trials.parquet`
+- `runs/<run_id>/best_params.json`
+- `runs/<run_id>/model/` (TensorFlow SavedModel)
 
 ## Optional dependencies
 - LLM providers: `pip install -e .[llm]`

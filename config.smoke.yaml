@@ -8,15 +8,15 @@ data:
 
 train:
   enabled: true
-  max_trials: 20
-  timeout_minutes: 30
-  stage1_sample_fraction: 0.2
+  max_trials: 3
+  timeout_minutes: 5
+  stage1_sample_fraction: 0.5
   validation_fraction: 0.2
   test_fraction: 0.1
-  epochs_tuning: 20
-  epochs_final: 40
-  patience: 5
-  top_k_final: 2
+  epochs_tuning: 8
+  epochs_final: 12
+  patience: 3
+  top_k_final: 1
   direction: maximize
 
 preprocess:

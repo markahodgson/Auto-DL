@@ -43,11 +43,26 @@ class DataConfig(BaseModel):
     parquet_intermediate: bool = True
 
 
+class TrainConfig(BaseModel):
+    enabled: bool = True
+    max_trials: int = Field(default=20, ge=1)
+    timeout_minutes: int = Field(default=30, ge=1)
+    stage1_sample_fraction: float = Field(default=0.2, ge=0.01, le=1.0)
+    validation_fraction: float = Field(default=0.2, ge=0.05, le=0.5)
+    test_fraction: float = Field(default=0.1, ge=0.05, le=0.4)
+    epochs_tuning: int = Field(default=20, ge=1)
+    epochs_final: int = Field(default=40, ge=1)
+    patience: int = Field(default=5, ge=1)
+    top_k_final: int = Field(default=2, ge=1)
+    direction: Literal["maximize", "minimize"] = "maximize"
+
+
 class AppConfig(BaseModel):
     runs_dir: str = "runs"
     sample_fraction_tuning: float = Field(default=0.1, ge=0.01, le=1.0)
     random_seed: int = 42
     data: DataConfig = DataConfig()
+    train: TrainConfig = TrainConfig()
     preprocess: PreprocessConfig = PreprocessConfig()
     llm: LLMConfig = LLMConfig()
     tracking: TrackingConfig = TrackingConfig()

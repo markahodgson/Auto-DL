@@ -6,6 +6,19 @@ data:
   input_format: csv
   parquet_intermediate: true
 
+train:
+  enabled: true
+  max_trials: 20
+  timeout_minutes: 30
+  stage1_sample_fraction: 0.2
+  validation_fraction: 0.2
+  test_fraction: 0.1
+  epochs_tuning: 20
+  epochs_final: 40
+  patience: 5
+  top_k_final: 2
+  direction: maximize
+
 preprocess:
   normalize_numeric: true
   one_hot_categorical: true

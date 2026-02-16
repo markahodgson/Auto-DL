@@ -12,7 +12,7 @@ from autodl.policy.engine import select_text_backend, should_call_llm
 from autodl.preprocess import preprocess_dataframe
 from autodl.profiling import profile_dataframe
 from autodl.tracking.factory import make_tracker
-from autodl.train import train_placeholder
+from autodl.train import train_with_optuna
 from autodl.utils import ensure_dir, utc_run_id, write_json
 
 app = typer.Typer(help="Local-first AutoDL CLI scaffolding.")
@@ -126,9 +126,16 @@ def train(
     tracker = make_tracker(config.tracking)
     tracker.start_run(run_id, run_dir, params=config.model_dump(mode="json"))
 
-    summary = train_placeholder(parquet_path=parquet, target=target, run_dir=run_dir, config=config)
+    summary = train_with_optuna(parquet_path=parquet, target=target, run_dir=run_dir, config=config)
     write_json(run_dir / "metrics_summary.json", summary)
-    tracker.log_metrics({"sample_rows": summary["sample_rows"], "n_features": summary["n_features"]})
+    tracker.log_metrics(
+        {
+            "sample_rows": summary["sample_rows"],
+            "n_features": summary["n_features"],
+            "best_stage1_value": summary["best_stage1_value"],
+            "best_final_score": summary["best_final_score"],
+        }
+    )
     tracker.finish_run()
 
     write_json(
@@ -139,11 +146,11 @@ def train(
             "input_parquet": str(parquet),
             "target": target,
             "config": config.model_dump(mode="json"),
-            "notes": "Training command is currently scaffold-only; integrate TensorFlow+Optuna next.",
+            "notes": "Training completed with TensorFlow + Optuna.",
         },
     )
 
-    typer.echo(f"Training scaffold run complete. See {run_dir}")
+    typer.echo(f"Training run complete. See {run_dir}")
 
 
 if __name__ == "__main__":
