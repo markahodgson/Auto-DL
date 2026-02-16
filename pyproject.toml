@@ -21,7 +21,8 @@ dependencies = [
 [project.optional-dependencies]
 train = [
   "tensorflow>=2.16",
-  "optuna>=3.6"
+  "optuna>=3.6",
+  "matplotlib>=3.8"
 ]
 llm = [
   "ollama>=0.3.1",
@@ -33,6 +34,7 @@ tracking = [
 all = [
   "tensorflow>=2.16",
   "optuna>=3.6",
+  "matplotlib>=3.8",
   "ollama>=0.3.1",
   "openai>=1.37",
   "wandb>=0.17"

@@ -55,6 +55,8 @@ class TrainConfig(BaseModel):
     patience: int = Field(default=5, ge=1)
     top_k_final: int = Field(default=2, ge=1)
     direction: Literal["maximize", "minimize"] = "maximize"
+    generate_report: bool = True
+    generate_plots: bool = True
 
 
 class AppConfig(BaseModel):

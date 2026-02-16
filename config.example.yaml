@@ -18,6 +18,8 @@ train:
   patience: 5
   top_k_final: 2
   direction: maximize
+  generate_report: true
+  generate_plots: true
 
 preprocess:
   normalize_numeric: true

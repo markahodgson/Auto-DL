@@ -6,9 +6,22 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+from sklearn.metrics import (
+    accuracy_score,
+    confusion_matrix,
+    f1_score,
+    mean_absolute_error,
+    mean_squared_error,
+    precision_score,
+    r2_score,
+    recall_score,
+    roc_auc_score,
+    roc_curve,
+)
 from sklearn.model_selection import train_test_split
 
 from autodl.config import AppConfig
+from autodl.llm.factory import make_llm_provider
 from autodl.utils import write_json
 
 
@@ -138,6 +151,281 @@ def _split_data(
     return X_train, X_val, X_test, y_train, y_val, y_test
 
 
+def _compute_threshold_metrics(y_true: np.ndarray, y_prob: np.ndarray, threshold: float) -> dict[str, float]:
+    y_pred = (y_prob >= threshold).astype(np.int32)
+    return {
+        "accuracy": float(accuracy_score(y_true, y_pred)),
+        "precision": float(precision_score(y_true, y_pred, zero_division=0)),
+        "recall": float(recall_score(y_true, y_pred, zero_division=0)),
+        "f1": float(f1_score(y_true, y_pred, zero_division=0)),
+    }
+
+
+def _best_threshold_by_f1(y_val: np.ndarray, val_prob: np.ndarray) -> tuple[float, pd.DataFrame]:
+    thresholds = np.linspace(0.05, 0.95, 37)
+    rows = []
+    for threshold in thresholds:
+        metrics = _compute_threshold_metrics(y_val, val_prob, float(threshold))
+        rows.append({"threshold": float(threshold), **metrics})
+    frame = pd.DataFrame(rows)
+    best_row = frame.sort_values("f1", ascending=False).iloc[0]
+    return float(best_row["threshold"]), frame
+
+
+def _try_import_matplotlib() -> tuple[Any, Any] | tuple[None, None]:
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        return None, None
+    return plt, np
+
+
+def _save_optuna_progress_plot(trials_df: pd.DataFrame, run_dir: Path) -> Path | None:
+    if trials_df.empty or "value" not in trials_df.columns:
+        return None
+    plt, _ = _try_import_matplotlib()
+    if plt is None:
+        return None
+
+    values = trials_df["value"].astype(float).to_numpy()
+    best = np.maximum.accumulate(values)
+    out = run_dir / "optuna_progress.png"
+
+    plt.figure(figsize=(8, 4))
+    plt.plot(values, label="trial value", alpha=0.7)
+    plt.plot(best, label="best so far", linewidth=2)
+    plt.xlabel("Trial")
+    plt.ylabel("Objective")
+    plt.title("Optuna Optimization Progress")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(out, dpi=140)
+    plt.close()
+    return out
+
+
+def _plot_confusion_matrix(cm: np.ndarray, out: Path, title: str) -> Path | None:
+    plt, _ = _try_import_matplotlib()
+    if plt is None:
+        return None
+
+    plt.figure(figsize=(6, 5))
+    plt.imshow(cm, cmap="Blues")
+    plt.title(title)
+    plt.colorbar()
+    plt.xlabel("Predicted")
+    plt.ylabel("Actual")
+    for i in range(cm.shape[0]):
+        for j in range(cm.shape[1]):
+            plt.text(j, i, str(cm[i, j]), ha="center", va="center", fontsize=9)
+    plt.tight_layout()
+    plt.savefig(out, dpi=140)
+    plt.close()
+    return out
+
+
+def _evaluate_and_plot(
+    task_type: str,
+    y_val: np.ndarray,
+    y_test: np.ndarray,
+    pred_val: np.ndarray,
+    pred_test: np.ndarray,
+    run_dir: Path,
+    make_plots: bool,
+) -> tuple[dict[str, Any], list[str]]:
+    plot_paths: list[str] = []
+
+    if task_type == "binary":
+        val_prob = pred_val.reshape(-1)
+        test_prob = pred_test.reshape(-1)
+        best_threshold, threshold_frame = _best_threshold_by_f1(y_val, val_prob)
+        threshold_path = run_dir / "threshold_metrics.csv"
+        threshold_frame.to_csv(threshold_path, index=False)
+
+        test_metrics = _compute_threshold_metrics(y_test, test_prob, best_threshold)
+        test_metrics["roc_auc"] = float(roc_auc_score(y_test, test_prob))
+
+        y_pred_test = (test_prob >= best_threshold).astype(np.int32)
+        cm = confusion_matrix(y_test, y_pred_test)
+
+        if make_plots:
+            cm_plot = _plot_confusion_matrix(cm, run_dir / "confusion_matrix.png", "Binary Confusion Matrix")
+            if cm_plot:
+                plot_paths.append(str(cm_plot))
+
+            plt, _ = _try_import_matplotlib()
+            if plt is not None:
+                curve_out = run_dir / "threshold_curve.png"
+                plt.figure(figsize=(8, 4))
+                plt.plot(threshold_frame["threshold"], threshold_frame["precision"], label="precision")
+                plt.plot(threshold_frame["threshold"], threshold_frame["recall"], label="recall")
+                plt.plot(threshold_frame["threshold"], threshold_frame["f1"], label="f1")
+                plt.axvline(best_threshold, linestyle="--", color="black", alpha=0.6, label="best threshold")
+                plt.xlabel("Threshold")
+                plt.ylabel("Score")
+                plt.title("Threshold Analysis (Validation)")
+                plt.legend()
+                plt.tight_layout()
+                plt.savefig(curve_out, dpi=140)
+                plt.close()
+                plot_paths.append(str(curve_out))
+
+                fpr, tpr, _ = roc_curve(y_test, test_prob)
+                roc_out = run_dir / "roc_curve.png"
+                plt.figure(figsize=(6, 6))
+                plt.plot(fpr, tpr, label=f"AUC = {test_metrics['roc_auc']:.4f}")
+                plt.plot([0, 1], [0, 1], linestyle="--", color="gray")
+                plt.xlabel("False Positive Rate")
+                plt.ylabel("True Positive Rate")
+                plt.title("ROC Curve")
+                plt.legend()
+                plt.tight_layout()
+                plt.savefig(roc_out, dpi=140)
+                plt.close()
+                plot_paths.append(str(roc_out))
+
+        return (
+            {
+                "task_type": "binary",
+                "selected_threshold": float(best_threshold),
+                "test_metrics": test_metrics,
+                "confusion_matrix": cm.tolist(),
+                "threshold_metrics_path": str(threshold_path),
+            },
+            plot_paths,
+        )
+
+    if task_type == "multiclass":
+        test_pred = np.argmax(pred_test, axis=1).astype(np.int32)
+        metrics = {
+            "accuracy": float(accuracy_score(y_test, test_pred)),
+            "precision_macro": float(precision_score(y_test, test_pred, average="macro", zero_division=0)),
+            "recall_macro": float(recall_score(y_test, test_pred, average="macro", zero_division=0)),
+            "f1_macro": float(f1_score(y_test, test_pred, average="macro", zero_division=0)),
+        }
+        cm = confusion_matrix(y_test, test_pred)
+        if make_plots:
+            cm_plot = _plot_confusion_matrix(cm, run_dir / "confusion_matrix.png", "Multiclass Confusion Matrix")
+            if cm_plot:
+                plot_paths.append(str(cm_plot))
+        return (
+            {
+                "task_type": "multiclass",
+                "test_metrics": metrics,
+                "confusion_matrix": cm.tolist(),
+            },
+            plot_paths,
+        )
+
+    y_pred = pred_test.reshape(-1)
+    metrics = {
+        "rmse": float(np.sqrt(mean_squared_error(y_test, y_pred))),
+        "mae": float(mean_absolute_error(y_test, y_pred)),
+        "r2": float(r2_score(y_test, y_pred)),
+    }
+    if make_plots:
+        plt, _ = _try_import_matplotlib()
+        if plt is not None:
+            scatter = run_dir / "prediction_scatter.png"
+            plt.figure(figsize=(6, 6))
+            plt.scatter(y_test, y_pred, alpha=0.7)
+            min_v = min(float(np.min(y_test)), float(np.min(y_pred)))
+            max_v = max(float(np.max(y_test)), float(np.max(y_pred)))
+            plt.plot([min_v, max_v], [min_v, max_v], linestyle="--", color="gray")
+            plt.xlabel("Actual")
+            plt.ylabel("Predicted")
+            plt.title("Regression: Actual vs Predicted")
+            plt.tight_layout()
+            plt.savefig(scatter, dpi=140)
+            plt.close()
+            plot_paths.append(str(scatter))
+
+    return ({"task_type": "regression", "test_metrics": metrics}, plot_paths)
+
+
+def _maybe_llm_summary(config: AppConfig, summary_payload: dict[str, Any]) -> str | None:
+    if config.llm.provider == "none":
+        return None
+    try:
+        provider = make_llm_provider(config.llm)
+        system_prompt = "You are an ML experiment analyst. Return concise markdown only."
+        user_prompt = json.dumps(
+            {
+                "request": "Summarize model performance and key hyperparameter findings for a human reader.",
+                "summary": summary_payload,
+            }
+        )
+        text = provider.suggest(system_prompt, user_prompt)
+        return text.strip() if text else None
+    except Exception:
+        return None
+
+
+def _write_markdown_report(
+    run_dir: Path,
+    summary: dict[str, Any],
+    best_params: dict[str, Any],
+    evaluation: dict[str, Any],
+    plot_paths: list[str],
+    llm_summary: str | None,
+) -> Path:
+    lines: list[str] = []
+    lines.append("# Training Report")
+    lines.append("")
+    lines.append("## Overview")
+    lines.append(f"- Status: {summary['status']}")
+    lines.append(f"- Target: {summary['target']}")
+    lines.append(f"- Task Type: {summary['task_type']}")
+    lines.append(f"- Rows (full/sample): {summary['full_rows']} / {summary['sample_rows']}")
+    lines.append(f"- Features: {summary['n_features']}")
+    lines.append(f"- Optuna trials: {summary['optuna_trials']}")
+    lines.append(f"- Best stage-1 trial/value: {summary['best_stage1_trial']} / {summary['best_stage1_value']:.6f}")
+    lines.append(f"- Best final trial/score: {summary['best_final_trial']} / {summary['best_final_score']:.6f}")
+    lines.append("")
+
+    lines.append("## Best Hyperparameters")
+    for key, value in best_params.items():
+        lines.append(f"- {key}: {value}")
+    lines.append("")
+
+    lines.append("## Evaluation")
+    for key, value in evaluation.get("test_metrics", {}).items():
+        lines.append(f"- {key}: {value:.6f}")
+
+    if evaluation.get("task_type") == "binary":
+        lines.append(f"- selected_threshold: {evaluation.get('selected_threshold', 0.5):.4f}")
+
+    cm = evaluation.get("confusion_matrix")
+    if cm:
+        lines.append("")
+        lines.append("### Confusion Matrix")
+        lines.append("")
+        lines.append("```json")
+        lines.append(json.dumps(cm, indent=2))
+        lines.append("```")
+
+    if llm_summary:
+        lines.append("")
+        lines.append("## LLM Summary")
+        lines.append("")
+        lines.append(llm_summary)
+
+    if plot_paths:
+        lines.append("")
+        lines.append("## Plots")
+        lines.append("")
+        for path in plot_paths:
+            image_name = Path(path).name
+            lines.append(f"### {image_name}")
+            lines.append("")
+            lines.append(f"![{image_name}]({image_name})")
+            lines.append("")
+
+    report_path = run_dir / "REPORT.md"
+    report_path.write_text("\n".join(lines).strip() + "\n", encoding="utf-8")
+    return report_path
+
+
 def train_with_optuna(
     parquet_path: Path,
     target: str,
@@ -161,23 +449,23 @@ def train_with_optuna(
         raise ValueError("Feature dimensionality is very high for dense TensorFlow baseline (>20k). Reduce features before training.")
 
     task_type, n_classes = _infer_task(y_series)
+    classes: list[Any] | None = None
     if task_type in {"binary", "multiclass"} and not pd.api.types.is_numeric_dtype(y_series):
-        y_codes = pd.Categorical(y_series).codes
-        y = np.asarray(y_codes, dtype=np.int32)
+        cat = pd.Categorical(y_series)
+        classes = cat.categories.tolist()
+        y = np.asarray(cat.codes, dtype=np.int32)
     elif task_type in {"binary", "multiclass"}:
         y = np.asarray(y_series, dtype=np.int32)
+        classes = sorted(pd.Series(y).dropna().unique().tolist())
     else:
         y = np.asarray(y_series, dtype=np.float32)
 
     sampled_df = stage_sample(df, config, target=target)
     sampled_X = _to_dense_float32(sampled_df.drop(columns=[target]))
-    sampled_y_series = sampled_df[target]
-    if task_type in {"binary", "multiclass"} and not pd.api.types.is_numeric_dtype(sampled_y_series):
-        sampled_y = np.asarray(pd.Categorical(sampled_y_series).codes, dtype=np.int32)
-    elif task_type in {"binary", "multiclass"}:
-        sampled_y = np.asarray(sampled_y_series, dtype=np.int32)
+    if task_type in {"binary", "multiclass"}:
+        sampled_y = y[sampled_df.index.to_numpy()]
     else:
-        sampled_y = np.asarray(sampled_y_series, dtype=np.float32)
+        sampled_y = np.asarray(sampled_df[target], dtype=np.float32)
 
     X_train, X_val, _X_test, y_train, y_val, _y_test = _split_data(
         sampled_X,
@@ -287,13 +575,27 @@ def train_with_optuna(
     if best_model is None:
         raise RuntimeError("Failed to select best final model.")
 
-    eval_result = best_model.evaluate(X_test_f, y_test_f, verbose=0)
-    metric_names = best_model.metrics_names
-    eval_metrics = {name: float(value) for name, value in zip(metric_names, eval_result)}
+    pred_val = best_model.predict(X_val_f, verbose=0)
+    pred_test = best_model.predict(X_test_f, verbose=0)
+
+    evaluation, evaluation_plot_paths = _evaluate_and_plot(
+        task_type=task_type,
+        y_val=np.asarray(y_val_f),
+        y_test=np.asarray(y_test_f),
+        pred_val=np.asarray(pred_val),
+        pred_test=np.asarray(pred_test),
+        run_dir=run_dir,
+        make_plots=config.train.generate_plots,
+    )
 
     model_dir = run_dir / "model"
     model_dir.mkdir(parents=True, exist_ok=True)
     best_model.export(str(model_dir))
+
+    optuna_plot = _save_optuna_progress_plot(trials_df, run_dir) if config.train.generate_plots else None
+    plot_paths = list(evaluation_plot_paths)
+    if optuna_plot is not None:
+        plot_paths.append(str(optuna_plot))
 
     summary = {
         "status": "ok",
@@ -309,11 +611,29 @@ def train_with_optuna(
         "best_final_trial": best_trial_number,
         "best_final_score": best_final_score,
         "final_candidates": final_scores,
-        "test_metrics": eval_metrics,
+        "test_metrics": evaluation.get("test_metrics", {}),
+        "evaluation": evaluation,
+        "class_labels": classes,
+        "plots": plot_paths,
         "model_dir": str(model_dir),
         "trials_path": str(trials_path),
     }
 
     write_json(run_dir / "training_summary.json", summary)
-    (run_dir / "best_params.json").write_text(json.dumps(study.best_trial.params, indent=2), encoding="utf-8")
+    best_params = study.best_trial.params
+    (run_dir / "best_params.json").write_text(json.dumps(best_params, indent=2), encoding="utf-8")
+
+    if config.train.generate_report:
+        llm_summary = _maybe_llm_summary(config, summary)
+        report_path = _write_markdown_report(
+            run_dir=run_dir,
+            summary=summary,
+            best_params=best_params,
+            evaluation=evaluation,
+            plot_paths=plot_paths,
+            llm_summary=llm_summary,
+        )
+        summary["report_path"] = str(report_path)
+        write_json(run_dir / "training_summary.json", summary)
+
     return summary
