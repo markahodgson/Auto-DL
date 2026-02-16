@@ -1,0 +1,34 @@
+runs_dir: runs
+sample_fraction_tuning: 0.1
+random_seed: 42
+
+data:
+  input_format: csv
+  parquet_intermediate: true
+
+preprocess:
+  normalize_numeric: true
+  one_hot_categorical: true
+  text_backend: hashing
+  passthrough_columns: []
+  max_text_vocab: 50000
+  text_hash_features: 262144
+
+llm:
+  provider: none
+  model: llama3.1
+  base_url: http://localhost:11434
+  api_key_env: null
+  temperature: 0.0
+  timeout_seconds: 60
+
+tracking:
+  backend: local
+  enabled: true
+  project: dnn-automation
+  entity: null
+  mode: offline
+
+policy:
+  llm_fallback_threshold: 0.8
+  user_confirmation_threshold: 0.5
