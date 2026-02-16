@@ -1,0 +1,111 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dnn-automation.local/schemas/llm-director-plan.schema.json",
+  "title": "LLMDirectorPlan",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "version",
+    "task",
+    "target",
+    "confidence",
+    "columns",
+    "preprocessing",
+    "review_questions"
+  ],
+  "properties": {
+    "version": {
+      "type": "string",
+      "pattern": "^1\\.[0-9]+$"
+    },
+    "task": {
+      "type": "string",
+      "enum": ["classification", "regression"]
+    },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["column", "reason"],
+      "properties": {
+        "column": { "type": "string", "minLength": 1 },
+        "reason": { "type": "string", "minLength": 8 }
+      }
+    },
+    "confidence": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "narrative_summary": {
+      "type": "string"
+    },
+    "columns": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "role", "semantic_type", "actions", "reason", "confidence"],
+        "properties": {
+          "name": { "type": "string", "minLength": 1 },
+          "role": {
+            "type": "string",
+            "enum": ["target", "feature", "id", "leakage_risk", "drop"]
+          },
+          "semantic_type": {
+            "type": "string",
+            "enum": ["numeric", "categorical", "ordinal", "boolean", "text", "datetime", "unknown"]
+          },
+          "actions": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": [
+                "impute_median",
+                "impute_mode",
+                "fill_missing_token",
+                "one_hot",
+                "binary_map",
+                "ordinal_map",
+                "scale_standard",
+                "vectorize_hashing",
+                "vectorize_tfidf",
+                "parse_datetime",
+                "drop"
+              ]
+            }
+          },
+          "mapping": {
+            "type": "object",
+            "additionalProperties": {
+              "type": ["string", "number", "boolean", "null"]
+            }
+          },
+          "reason": { "type": "string", "minLength": 8 },
+          "confidence": { "type": "number", "minimum": 0, "maximum": 1 }
+        }
+      }
+    },
+    "preprocessing": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["text_backend", "normalize_numeric", "one_hot_categorical"],
+      "properties": {
+        "text_backend": {
+          "type": "string",
+          "enum": ["none", "hashing", "tfidf", "tf_text_vectorization"]
+        },
+        "normalize_numeric": { "type": "boolean" },
+        "one_hot_categorical": { "type": "boolean" },
+        "passthrough_columns": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "review_questions": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 3 }
+    }
+  }
+}

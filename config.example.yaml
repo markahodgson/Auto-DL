@@ -47,3 +47,10 @@ tracking:
 policy:
   llm_fallback_threshold: 0.8
   user_confirmation_threshold: 0.5
+
+narrative:
+  dataset_summary: ""
+  target_definition: ""
+  business_goal: ""
+  leakage_warnings: []
+  column_hints: {}

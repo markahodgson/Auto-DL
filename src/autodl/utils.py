@@ -18,3 +18,12 @@ def ensure_dir(path: Path) -> Path:
 def write_json(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def write_jsonl(path: Path, payloads: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [json.dumps(item, ensure_ascii=False) for item in payloads]
+    content = "\n".join(lines)
+    if lines:
+        content += "\n"
+    path.write_text(content, encoding="utf-8")

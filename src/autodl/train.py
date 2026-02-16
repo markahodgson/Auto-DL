@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 from typing import Any
 
@@ -8,6 +9,7 @@ import numpy as np
 import pandas as pd
 from sklearn.metrics import (
     accuracy_score,
+    brier_score_loss,
     confusion_matrix,
     f1_score,
     mean_absolute_error,
@@ -22,6 +24,8 @@ from sklearn.model_selection import train_test_split
 
 from autodl.config import AppConfig
 from autodl.llm.factory import make_llm_provider
+from autodl.policy.metric_director import decide_primary_metric
+from autodl.policy.train_director import TrainingPolicyDecision, build_training_policy
 from autodl.utils import write_json
 
 
@@ -70,7 +74,14 @@ def _infer_task(y: pd.Series) -> tuple[str, int]:
     return "regression", int(unique)
 
 
-def _build_model(tf: Any, trial: Any, input_dim: int, task_type: str, n_classes: int) -> Any:
+def _build_model(
+    tf: Any,
+    trial: Any,
+    input_dim: int,
+    task_type: str,
+    n_classes: int,
+    training_policy: TrainingPolicyDecision,
+) -> Any:
     n_layers = trial.suggest_int("n_layers", 1, 4)
     dropout = trial.suggest_float("dropout", 0.0, 0.5)
     learning_rate = trial.suggest_float("learning_rate", 1e-4, 5e-2, log=True)
@@ -86,15 +97,18 @@ def _build_model(tf: Any, trial: Any, input_dim: int, task_type: str, n_classes:
 
     if task_type == "binary":
         model.add(tf.keras.layers.Dense(1, activation="sigmoid"))
-        loss = "binary_crossentropy"
+        if training_policy.loss == "binary_focal_crossentropy":
+            loss = tf.keras.losses.BinaryFocalCrossentropy(gamma=2.0)
+        else:
+            loss = "binary_crossentropy"
         metrics = [tf.keras.metrics.BinaryAccuracy(name="accuracy"), tf.keras.metrics.AUC(name="auc")]
     elif task_type == "multiclass":
         model.add(tf.keras.layers.Dense(n_classes, activation="softmax"))
-        loss = "sparse_categorical_crossentropy"
+        loss = training_policy.loss
         metrics = [tf.keras.metrics.SparseCategoricalAccuracy(name="accuracy")]
     else:
         model.add(tf.keras.layers.Dense(1, activation="linear"))
-        loss = "mse"
+        loss = training_policy.loss
         metrics = [tf.keras.metrics.RootMeanSquaredError(name="rmse")]
 
     model.compile(
@@ -149,6 +163,23 @@ def _split_data(
         stratify=stratify_train,
     )
     return X_train, X_val, X_test, y_train, y_val, y_test
+
+
+def _fit_class_weight(training_policy: TrainingPolicyDecision, y_train: np.ndarray) -> dict[int, float] | None:
+    if not training_policy.use_class_weights:
+        return None
+    if not training_policy.class_weight_by_label:
+        return None
+    present = {int(v) for v in np.unique(y_train).tolist()}
+    out: dict[int, float] = {}
+    for label_str, weight in training_policy.class_weight_by_label.items():
+        try:
+            label = int(label_str)
+        except ValueError:
+            continue
+        if label in present:
+            out[label] = float(weight)
+    return out or None
 
 
 def _compute_threshold_metrics(y_true: np.ndarray, y_prob: np.ndarray, threshold: float) -> dict[str, float]:
@@ -244,6 +275,7 @@ def _evaluate_and_plot(
 
         test_metrics = _compute_threshold_metrics(y_test, test_prob, best_threshold)
         test_metrics["roc_auc"] = float(roc_auc_score(y_test, test_prob))
+        test_metrics["brier_score"] = float(brier_score_loss(y_test, test_prob))
 
         y_pred_test = (test_prob >= best_threshold).astype(np.int32)
         cm = confusion_matrix(y_test, y_pred_test)
@@ -343,6 +375,217 @@ def _evaluate_and_plot(
     return ({"task_type": "regression", "test_metrics": metrics}, plot_paths)
 
 
+def _safe_read_json(path: Path) -> dict[str, Any] | None:
+    try:
+        if not path.exists():
+            return None
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _load_preprocess_summary(parquet_path: Path) -> dict[str, Any]:
+    prep_dir = parquet_path.parent
+    summary: dict[str, Any] = {
+        "available": False,
+        "source_run_dir": str(prep_dir),
+    }
+
+    preprocess_metadata = _safe_read_json(prep_dir / "preprocess_metadata.json") or {}
+    preprocess_manifest = _safe_read_json(prep_dir / "run_manifest.json") or {}
+    director_plan = _safe_read_json(prep_dir / "director_plan.json") or {}
+
+    if preprocess_metadata or preprocess_manifest:
+        summary["available"] = True
+
+    preprocess_config = preprocess_manifest.get("config", {}).get("preprocess", {})
+    director_meta = preprocess_metadata.get("director", {})
+    columns = director_plan.get("columns", []) if isinstance(director_plan, dict) else []
+
+    dropped_columns = 0
+    mapped_columns = 0
+    for col in columns:
+        actions = col.get("actions", []) if isinstance(col, dict) else []
+        if "drop" in actions:
+            dropped_columns += 1
+        if "binary_map" in actions or "ordinal_map" in actions:
+            mapped_columns += 1
+
+    summary.update(
+        {
+            "text_backend": preprocess_metadata.get("text_backend") or preprocess_config.get("text_backend"),
+            "normalize_numeric": preprocess_config.get("normalize_numeric"),
+            "one_hot_categorical": preprocess_config.get("one_hot_categorical"),
+            "director_source": director_meta.get("source"),
+            "director_confidence": director_meta.get("confidence"),
+            "review_questions": director_meta.get("review_questions", []),
+            "narrative_business_goal": (director_meta.get("narrative_applied") or {}).get("business_goal", ""),
+            "dropped_columns": dropped_columns,
+            "mapped_columns": mapped_columns,
+            "narrative_present": bool((director_meta.get("narrative_applied") or {}).get("dataset_summary")),
+        }
+    )
+    return summary
+
+
+def _build_data_characteristics(X_df: pd.DataFrame, y: np.ndarray, task_type: str) -> dict[str, Any]:
+    n_rows = int(X_df.shape[0])
+    unique_ratios: list[float] = []
+    low_variance_cols = 0
+    for col in X_df.columns:
+        series = X_df[col]
+        unique_ratio = float(series.nunique(dropna=True) / max(n_rows, 1))
+        unique_ratios.append(unique_ratio)
+        if unique_ratio <= 0.01:
+            low_variance_cols += 1
+
+    mean_unique_ratio = float(np.mean(unique_ratios)) if unique_ratios else 0.0
+
+    result: dict[str, Any] = {
+        "n_rows": n_rows,
+        "n_features": int(X_df.shape[1]),
+        "mean_feature_unique_ratio": mean_unique_ratio,
+        "low_variance_columns": int(low_variance_cols),
+    }
+
+    if task_type == "binary":
+        values, counts = np.unique(y, return_counts=True)
+        class_counts = {str(int(v)): int(c) for v, c in zip(values, counts, strict=False)}
+        total = float(sum(class_counts.values()))
+        minority = min(class_counts.values()) if class_counts else 0
+        majority = max(class_counts.values()) if class_counts else 1
+        minority_rate = float(minority / max(total, 1.0))
+        imbalance_ratio = float(minority / max(majority, 1))
+        positive_rate = float(class_counts.get("1", 0) / max(total, 1.0))
+        result.update(
+            {
+                "class_counts": class_counts,
+                "positive_rate": positive_rate,
+                "minority_rate": minority_rate,
+                "imbalance_ratio": imbalance_ratio,
+                "rare_outcome": bool(minority_rate < 0.2),
+            }
+        )
+    elif task_type == "multiclass":
+        values, counts = np.unique(y, return_counts=True)
+        class_counts = {str(int(v)): int(c) for v, c in zip(values, counts, strict=False)}
+        probs = np.asarray(counts, dtype=np.float64) / max(np.sum(counts), 1.0)
+        entropy = float(-np.sum(np.where(probs > 0, probs * np.log2(probs), 0.0)))
+        max_entropy = math.log2(max(len(counts), 1)) if len(counts) > 1 else 1.0
+        normalized_entropy = float(entropy / max(max_entropy, 1e-6))
+        result.update(
+            {
+                "class_counts": class_counts,
+                "class_entropy_normalized": normalized_entropy,
+                "class_diversity": "high" if normalized_entropy >= 0.8 else "medium" if normalized_entropy >= 0.5 else "low",
+            }
+        )
+
+    return result
+
+
+def _score_band(metric: str, value: float) -> str:
+    if metric == "roc_auc":
+        if value >= 0.9:
+            return "excellent"
+        if value >= 0.8:
+            return "good"
+        if value >= 0.7:
+            return "fair"
+        return "weak"
+    if metric in {"f1", "f1_macro", "accuracy", "precision", "recall", "precision_macro", "recall_macro"}:
+        if value >= 0.85:
+            return "good"
+        if value >= 0.7:
+            return "fair"
+        return "weak"
+    if metric == "brier_score":
+        if value <= 0.12:
+            return "good"
+        if value <= 0.2:
+            return "fair"
+        return "weak"
+    if metric == "rmse":
+        return "context-dependent"
+    if metric == "r2":
+        if value >= 0.8:
+            return "good"
+        if value >= 0.5:
+            return "fair"
+        return "weak"
+    return "context-dependent"
+
+
+def _deterministic_metric_interpretation(
+    task_type: str,
+    metrics: dict[str, float],
+    primary_metric: dict[str, Any],
+    data_characteristics: dict[str, Any],
+) -> dict[str, Any]:
+    metric_name = str(primary_metric.get("metric") or "")
+    metric_value = metrics.get(metric_name)
+    band = _score_band(metric_name, float(metric_value)) if metric_value is not None else "unknown"
+
+    bullets: list[str] = []
+    bullets.append(f"- Primary metric `{metric_name}` is `{band}` for a `{task_type}` task.")
+    if metric_value is not None:
+        bullets.append(f"- Observed `{metric_name}` value: `{float(metric_value):.6f}`.")
+
+    if task_type == "binary":
+        rare_outcome = bool(data_characteristics.get("rare_outcome", False))
+        imbalance_ratio = data_characteristics.get("imbalance_ratio")
+        positive_rate = data_characteristics.get("positive_rate")
+        bullets.append(
+            f"- Binary outcome profile: rare_outcome=`{rare_outcome}`, positive_rate=`{float(positive_rate):.3f}`"
+            + (f", imbalance_ratio=`{float(imbalance_ratio):.3f}`." if imbalance_ratio is not None else ".")
+        )
+        if rare_outcome and "roc_auc" in metrics and metric_name != "roc_auc":
+            bullets.append("- For rare outcomes, consider using `roc_auc` as primary metric to reduce threshold sensitivity.")
+        if "brier_score" in metrics:
+            brier_band = _score_band("brier_score", float(metrics["brier_score"]))
+            bullets.append(f"- Calibration check via `brier_score` is `{brier_band}` (`{float(metrics['brier_score']):.6f}`).")
+    elif task_type == "multiclass":
+        diversity = data_characteristics.get("class_diversity", "unknown")
+        bullets.append(f"- Class diversity is `{diversity}` based on normalized class entropy.")
+    else:
+        bullets.append("- Regression metric quality may depend on target scale and domain tolerance.")
+
+    mean_unique_ratio = float(data_characteristics.get("mean_feature_unique_ratio", 0.0))
+    low_var = int(data_characteristics.get("low_variance_columns", 0))
+    bullets.append(
+        f"- Feature diversity snapshot: mean_unique_ratio=`{mean_unique_ratio:.3f}`, low_variance_columns=`{low_var}`."
+    )
+
+    overall = "good" if band in {"good", "excellent"} else "fair" if band == "fair" else "needs_attention"
+    return {
+        "source": "deterministic",
+        "overall_assessment": overall,
+        "text": "\n".join(bullets),
+    }
+
+
+def _maybe_llm_metric_interpretation(config: AppConfig, payload: dict[str, Any]) -> dict[str, Any] | None:
+    if config.llm.provider == "none":
+        return None
+    try:
+        provider = make_llm_provider(config.llm)
+        system_prompt = (
+            "You are an ML evaluation analyst. Return concise markdown bullets only. "
+            "Assess whether metrics are good for the problem type, using rarity/imbalance and diversity context."
+        )
+        user_prompt = json.dumps(payload)
+        text = provider.suggest(system_prompt, user_prompt)
+        if not text:
+            return None
+        return {
+            "source": "llm",
+            "overall_assessment": payload.get("deterministic", {}).get("overall_assessment", "unknown"),
+            "text": text.strip(),
+        }
+    except Exception:
+        return None
+
+
 def _maybe_llm_summary(config: AppConfig, summary_payload: dict[str, Any]) -> str | None:
     if config.llm.provider == "none":
         return None
@@ -351,7 +594,7 @@ def _maybe_llm_summary(config: AppConfig, summary_payload: dict[str, Any]) -> st
         system_prompt = "You are an ML experiment analyst. Return concise markdown only."
         user_prompt = json.dumps(
             {
-                "request": "Summarize model performance and key hyperparameter findings for a human reader.",
+                "request": "Write a concise summary with 3 parts: (1) problem + model type (binary/multiclass/regression and backend/framework), (2) preprocessing decisions, and (3) training progress.",
                 "summary": summary_payload,
             }
         )
@@ -368,10 +611,32 @@ def _write_markdown_report(
     evaluation: dict[str, Any],
     plot_paths: list[str],
     llm_summary: str | None,
+    training_policy: dict[str, Any] | None = None,
 ) -> Path:
     lines: list[str] = []
     lines.append("# Training Report")
     lines.append("")
+
+    evaluation_metrics = evaluation.get("test_metrics", {})
+    primary_metric_decision = summary.get("primary_metric") or {}
+    primary_metric = str(primary_metric_decision.get("metric") or "")
+    if not primary_metric and evaluation_metrics:
+        primary_metric = str(next(iter(evaluation_metrics.keys())))
+    primary_value = evaluation_metrics.get(primary_metric)
+
+    preprocessing_summary = summary.get("preprocessing_summary") or {}
+    director_confidence = preprocessing_summary.get("director_confidence")
+
+    lines.append("## Executive Summary")
+    lines.append(f"- Problem/Task: {summary.get('problem_type', 'unknown')} / {summary.get('task_type', 'unknown')}")
+    lines.append(f"- Model stack: {summary.get('model_backend', 'tensorflow')} + {summary.get('search_engine', 'optuna')}")
+    if primary_value is not None:
+        lines.append(f"- Primary result ({primary_metric}): {float(primary_value):.6f}")
+    lines.append(f"- Best final trial/score: {summary['best_final_trial']} / {summary['best_final_score']:.6f}")
+    if director_confidence is not None:
+        lines.append(f"- Preprocess director confidence: {float(director_confidence):.4f}")
+    lines.append("")
+
     lines.append("## Overview")
     lines.append(f"- Status: {summary['status']}")
     lines.append(f"- Target: {summary['target']}")
@@ -382,6 +647,49 @@ def _write_markdown_report(
     lines.append(f"- Best stage-1 trial/value: {summary['best_stage1_trial']} / {summary['best_stage1_value']:.6f}")
     lines.append(f"- Best final trial/score: {summary['best_final_trial']} / {summary['best_final_score']:.6f}")
     lines.append("")
+
+    lines.append("## Problem + Model")
+    lines.append(f"- Problem type: {summary.get('problem_type', 'unknown')}")
+    lines.append(f"- Task type: {summary.get('task_type', 'unknown')}")
+    lines.append(f"- Model backend: {summary.get('model_backend', 'tensorflow')}")
+    lines.append(f"- Model family: {summary.get('model_family', 'dense_neural_network')}")
+    lines.append(f"- Search engine: {summary.get('search_engine', 'optuna')}")
+    lines.append("")
+
+    lines.append("## Preprocessing Summary")
+    if preprocessing_summary.get("available"):
+        lines.append(f"- Source run: {preprocessing_summary.get('source_run_dir', '')}")
+        lines.append(f"- Text backend: {preprocessing_summary.get('text_backend', 'unknown')}")
+        lines.append(f"- Normalize numeric: {preprocessing_summary.get('normalize_numeric', 'unknown')}")
+        lines.append(f"- One-hot categorical: {preprocessing_summary.get('one_hot_categorical', 'unknown')}")
+        lines.append(f"- Director source: {preprocessing_summary.get('director_source', 'n/a')}")
+        confidence = preprocessing_summary.get("director_confidence")
+        if confidence is not None:
+            lines.append(f"- Director confidence: {float(confidence):.4f}")
+        lines.append(f"- Mapped columns: {preprocessing_summary.get('mapped_columns', 0)}")
+        lines.append(f"- Dropped columns: {preprocessing_summary.get('dropped_columns', 0)}")
+        lines.append(f"- Narrative provided: {preprocessing_summary.get('narrative_present', False)}")
+    else:
+        lines.append("- Preprocess metadata unavailable for this parquet input.")
+    lines.append("")
+
+    progress = summary.get("training_progress") or {}
+    lines.append("## Training Progress")
+    lines.append(f"- Stage-1 sample fraction: {progress.get('stage1_sample_fraction', 'n/a')}")
+    lines.append(f"- Stage-1 epochs: {progress.get('epochs_tuning', 'n/a')}")
+    lines.append(f"- Final epochs: {progress.get('epochs_final', 'n/a')}")
+    lines.append(f"- Early stopping patience: {progress.get('patience', 'n/a')}")
+    lines.append(f"- Trials completed: {progress.get('completed_trials', 'n/a')} / {progress.get('total_trials', 'n/a')}")
+    lines.append(f"- Finalists retrained: {progress.get('finalists_retrained', 'n/a')}")
+    lines.append("")
+
+    if primary_metric_decision:
+        lines.append("## Primary Metric Selection")
+        lines.append(f"- Selected metric: {primary_metric_decision.get('metric', 'n/a')}")
+        lines.append(f"- Source: {primary_metric_decision.get('source', 'unknown')}")
+        lines.append(f"- Confidence: {float(primary_metric_decision.get('confidence', 0.0)):.4f}")
+        lines.append(f"- Rationale: {primary_metric_decision.get('rationale', '')}")
+        lines.append("")
 
     lines.append("## Best Hyperparameters")
     for key, value in best_params.items():
@@ -410,6 +718,29 @@ def _write_markdown_report(
         lines.append("")
         lines.append(llm_summary)
 
+    if training_policy:
+        lines.append("")
+        lines.append("## Training Policy")
+        lines.append(f"- Source: {training_policy.get('source', 'unknown')}")
+        lines.append(f"- Loss: {training_policy.get('loss', 'n/a')}")
+        lines.append(f"- Use class weights: {training_policy.get('use_class_weights', False)}")
+        lines.append(f"- Confidence: {training_policy.get('confidence', 0.0):.4f}")
+        lines.append(f"- Rationale: {training_policy.get('rationale', '')}")
+        class_weights = training_policy.get("class_weight_by_label") or {}
+        if class_weights:
+            lines.append("- Class weights:")
+            for class_label, weight in class_weights.items():
+                lines.append(f"  - {class_label}: {weight:.6f}")
+
+    metric_interpretation = summary.get("metric_interpretation") or {}
+    if metric_interpretation:
+        lines.append("")
+        lines.append("## Metric Interpretation")
+        lines.append(f"- Source: {metric_interpretation.get('source', 'unknown')}")
+        lines.append(f"- Overall assessment: {metric_interpretation.get('overall_assessment', 'unknown')}")
+        lines.append("")
+        lines.append(metric_interpretation.get("text", ""))
+
     if plot_paths:
         lines.append("")
         lines.append("## Plots")
@@ -431,9 +762,11 @@ def train_with_optuna(
     target: str,
     run_dir: Path,
     config: AppConfig,
+    primary_metric_override: str | None = None,
 ) -> dict[str, Any]:
     tf, optuna = _import_train_deps()
     tf.keras.utils.set_random_seed(config.random_seed)
+    preprocess_summary = _load_preprocess_summary(parquet_path)
 
     df = pd.read_parquet(parquet_path)
     if target not in df.columns:
@@ -460,7 +793,15 @@ def train_with_optuna(
     else:
         y = np.asarray(y_series, dtype=np.float32)
 
+    training_policy = build_training_policy(
+        y_encoded=np.asarray(y),
+        task_type=task_type,
+        n_classes=max(n_classes, 1),
+        config=config,
+    )
+
     sampled_df = stage_sample(df, config, target=target)
+    data_characteristics = _build_data_characteristics(X_df=X_df, y=np.asarray(y), task_type=task_type)
     sampled_X = _to_dense_float32(sampled_df.drop(columns=[target]))
     if task_type in {"binary", "multiclass"}:
         sampled_y = y[sampled_df.index.to_numpy()]
@@ -484,6 +825,7 @@ def train_with_optuna(
             input_dim=X_train.shape[1],
             task_type=task_type,
             n_classes=max(n_classes, 2),
+            training_policy=training_policy,
         )
         callbacks = [
             tf.keras.callbacks.EarlyStopping(
@@ -500,6 +842,7 @@ def train_with_optuna(
             batch_size=batch_size,
             verbose=0,
             callbacks=callbacks,
+            class_weight=_fit_class_weight(training_policy, y_train),
         )
         return _score_history(task_type, history)
 
@@ -545,6 +888,7 @@ def train_with_optuna(
             input_dim=X_train_f.shape[1],
             task_type=task_type,
             n_classes=max(n_classes, 2),
+            training_policy=training_policy,
         )
         history = model.fit(
             X_train_f,
@@ -560,6 +904,7 @@ def train_with_optuna(
                     restore_best_weights=True,
                 )
             ],
+            class_weight=_fit_class_weight(training_policy, y_train_f),
         )
         score = _score_history(task_type, history)
         final_scores.append({"trial_number": int(trial.number), "score": float(score), "params": trial.params})
@@ -601,7 +946,11 @@ def train_with_optuna(
         "status": "ok",
         "message": "Training completed with TensorFlow + Optuna",
         "target": target,
+        "problem_type": "classification" if task_type in {"binary", "multiclass"} else "regression",
         "task_type": task_type,
+        "model_backend": "tensorflow",
+        "model_family": "dense_neural_network",
+        "search_engine": "optuna",
         "full_rows": int(df.shape[0]),
         "sample_rows": int(sampled_df.shape[0]),
         "n_features": int(X_df.shape[1]),
@@ -614,10 +963,66 @@ def train_with_optuna(
         "test_metrics": evaluation.get("test_metrics", {}),
         "evaluation": evaluation,
         "class_labels": classes,
+        "training_policy": training_policy.model_dump(mode="json"),
+        "preprocessing_summary": preprocess_summary,
+        "training_progress": {
+            "stage1_sample_fraction": config.train.stage1_sample_fraction,
+            "epochs_tuning": config.train.epochs_tuning,
+            "epochs_final": config.train.epochs_final,
+            "patience": config.train.patience,
+            "completed_trials": int(len(completed)),
+            "total_trials": int(len(study.trials)),
+            "finalists_retrained": int(len(finalists)),
+        },
         "plots": plot_paths,
         "model_dir": str(model_dir),
         "trials_path": str(trials_path),
     }
+
+    primary_metric = decide_primary_metric(
+        task_type=task_type,
+        evaluation_metrics=evaluation.get("test_metrics", {}),
+        y_encoded=np.asarray(y),
+        preprocess_summary=preprocess_summary,
+        config=config,
+    )
+
+    if primary_metric_override:
+        available_metrics = evaluation.get("test_metrics", {})
+        if primary_metric_override not in available_metrics:
+            raise ValueError(
+                f"Requested primary metric override '{primary_metric_override}' is unavailable. "
+                f"Available metrics: {', '.join(available_metrics.keys())}"
+            )
+        primary_metric = primary_metric.model_copy(
+            update={
+                "metric": primary_metric_override,
+                "confidence": 1.0,
+                "rationale": "User override via CLI option.",
+                "source": "user_override",
+            }
+        )
+
+    summary["primary_metric"] = primary_metric.model_dump(mode="json")
+
+    deterministic_interp = _deterministic_metric_interpretation(
+        task_type=task_type,
+        metrics=evaluation.get("test_metrics", {}),
+        primary_metric=summary["primary_metric"],
+        data_characteristics=data_characteristics,
+    )
+    llm_interp = _maybe_llm_metric_interpretation(
+        config=config,
+        payload={
+            "problem_type": summary.get("problem_type"),
+            "task_type": task_type,
+            "primary_metric": summary.get("primary_metric"),
+            "metrics": evaluation.get("test_metrics", {}),
+            "data_characteristics": data_characteristics,
+            "deterministic": deterministic_interp,
+        },
+    )
+    summary["metric_interpretation"] = llm_interp or deterministic_interp
 
     write_json(run_dir / "training_summary.json", summary)
     best_params = study.best_trial.params
@@ -632,6 +1037,7 @@ def train_with_optuna(
             evaluation=evaluation,
             plot_paths=plot_paths,
             llm_summary=llm_summary,
+            training_policy=summary.get("training_policy"),
         )
         summary["report_path"] = str(report_path)
         write_json(run_dir / "training_summary.json", summary)

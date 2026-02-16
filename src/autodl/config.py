@@ -43,6 +43,14 @@ class DataConfig(BaseModel):
     parquet_intermediate: bool = True
 
 
+class NarrativeConfig(BaseModel):
+    dataset_summary: str = ""
+    target_definition: str = ""
+    business_goal: str = ""
+    leakage_warnings: list[str] = Field(default_factory=list)
+    column_hints: dict[str, str] = Field(default_factory=dict)
+
+
 class TrainConfig(BaseModel):
     enabled: bool = True
     max_trials: int = Field(default=20, ge=1)
@@ -69,6 +77,7 @@ class AppConfig(BaseModel):
     llm: LLMConfig = LLMConfig()
     tracking: TrackingConfig = TrackingConfig()
     policy: PolicyConfig = PolicyConfig()
+    narrative: NarrativeConfig = NarrativeConfig()
 
 
 DEFAULT_CONFIG = AppConfig()

@@ -41,6 +41,18 @@ Local-first AutoDL scaffolding for wide/sparse tabular data with optional text f
 
 	`autodl train --parquet runs/<prep_run_id>/preprocessed.parquet --target label --config config.yaml`
 
+	Optional metric override:
+
+	`autodl train --parquet runs/<prep_run_id>/preprocessed.parquet --target label --config config.yaml --primary-metric f1_macro`
+
+Or run the full flow in one command:
+
+	`autodl run-full --data data/train.csv --target label --config config.yaml --narrative-file narrative.yaml`
+
+	Optional metric override in full flow:
+
+	`autodl run-full --data data/train.csv --target label --config config.yaml --primary-metric roc_auc`
+
 ## CLI preprocessing interaction (CSV -> profile -> preprocess)
 Use this flow when you want to see how the CLI identifies numeric/categorical/text columns and applies preprocessing choices.
 
@@ -63,10 +75,20 @@ Use this flow when you want to see how the CLI identifies numeric/categorical/te
 
 	`autodl preprocess --data data/your_file.csv --target label --config config.yaml`
 
+	Optional narrative-guided planning:
+
+	`autodl preprocess --data data/your_file.csv --target label --config config.yaml --narrative-file narrative.yaml`
+
+	For low-confidence director plans in non-interactive runs, add:
+
+	`--approve-low-confidence`
+
 4. Inspect preprocessing outputs:
 
 	- transformed data: `runs/<prep_run_id>/preprocessed.parquet`
 	- metadata summary: `runs/<prep_run_id>/preprocess_metadata.json`
+	- director plan (when enabled): `runs/<prep_run_id>/director_plan.json`
+	- decision log (when enabled): `runs/<prep_run_id>/decision_log.jsonl`
 
 ### How preprocessing choices are controlled
 Preprocessing behavior is configured in `config.yaml` under `preprocess:`.
@@ -113,12 +135,25 @@ What each choice does:
 ### Training report outputs
 After `autodl train`, the run directory now includes:
 - `REPORT.md` with model performance summary and hyperparameter findings
+- `Problem + Model` section (classification/regression + task type + backend/framework)
+- `Preprocessing Summary` section (director and preprocessing decisions)
+- `Training Progress` section (stages, trials, and retrain progress)
+- `Primary Metric Selection` section with objective-aware metric choice rationale (imbalance-aware, optional LLM refinement)
+- `Training Policy` section in `REPORT.md` describing selected loss and class-weight strategy
 - optional `LLM Summary` section in `REPORT.md` when `llm.provider` is enabled
 - confusion matrix and evaluation plots for classification tasks
 - threshold analysis files for binary classification (`threshold_metrics.csv`, threshold plot)
+- binary evaluation includes calibration metric (`brier_score`) in summary/report
 - optimization progress plot (`optuna_progress.png`)
+- `training_summary.json` includes `training_policy` for programmatic audit
 
 ## Optional dependencies
 - LLM providers: `pip install -e .[llm]`
 - W&B tracking: `pip install -e .[tracking]`
 - Training stack (next step): `pip install -e .[train]`
+
+## LLM director planning docs
+- Director MVP design and integration notes: `docs/llm_director_mvp.md`
+- Director JSON output schema: `docs/schemas/llm_director_plan.schema.json`
+- Prompt template (system + user payload): `docs/prompts/llm_director_prompt.md`
+- Unified orchestration graph + node contracts: `docs/workflows/agent_orchestration_graph.md`
