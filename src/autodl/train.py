@@ -392,7 +392,7 @@ def _load_preprocess_summary(parquet_path: Path) -> dict[str, Any]:
     }
 
     preprocess_metadata = _safe_read_json(prep_dir / "preprocess_metadata.json") or {}
-    preprocess_manifest = _safe_read_json(prep_dir / "run_manifest.json") or {}
+    preprocess_manifest = _safe_read_json(prep_dir / "preprocess_manifest.json") or _safe_read_json(prep_dir / "run_manifest.json") or {}
     director_plan = _safe_read_json(prep_dir / "director_plan.json") or {}
 
     if preprocess_metadata or preprocess_manifest:

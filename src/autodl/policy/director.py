@@ -102,7 +102,8 @@ def load_narrative_input(
         raw = yaml.safe_load(narrative_file.read_text(encoding="utf-8")) or {}
         if isinstance(raw, dict) and "narrative" in raw and isinstance(raw["narrative"], dict):
             raw = raw["narrative"]
-        merged = merged.model_copy(update=NarrativeInput.model_validate(raw).model_dump())
+        file_narrative = NarrativeInput.model_validate(raw)
+        merged = merged.model_copy(update=file_narrative.model_dump(exclude_unset=True))
 
     if narrative_text:
         merged = merged.model_copy(update={"dataset_summary": narrative_text.strip()})

@@ -29,6 +29,19 @@ def _resolve_target_column(df_columns: list[str], target: str) -> str:
     raise typer.BadParameter(f"Target column '{target}' was not found. Available columns: {', '.join(df_columns)}")
 
 
+def _resolve_train_output_context(parquet: Path, runs_dir: str, run_id: str | None) -> tuple[str, Path, str]:
+    if run_id:
+        return run_id, ensure_dir(Path(runs_dir) / run_id), "explicit_run_id"
+
+    parquet_name = parquet.name.lower()
+    parquet_parent = parquet.parent
+    if parquet_name == "preprocessed.parquet" and parquet_parent.exists():
+        return parquet_parent.name, ensure_dir(parquet_parent), "inferred_from_parquet_parent"
+
+    generated = utc_run_id("train")
+    return generated, ensure_dir(Path(runs_dir) / generated), "generated_train_run_id"
+
+
 def _run_preprocess(
     data: Path,
     target: str,
@@ -37,13 +50,15 @@ def _run_preprocess(
     narrative: str | None,
     use_director: bool,
     approve_low_confidence: bool,
+    run_id: str | None = None,
+    run_dir: Path | None = None,
 ) -> dict[str, str]:
     config = load_config(config_path)
     df = read_input(data)
 
     resolved_target = _resolve_target_column(list(df.columns), target)
-    run_id = utc_run_id("prep")
-    run_dir = ensure_dir(Path(config.runs_dir) / run_id)
+    effective_run_id = run_id or utc_run_id("prep")
+    effective_run_dir = run_dir or ensure_dir(Path(config.runs_dir) / effective_run_id)
 
     narrative_input = load_narrative_input(
         narrative_file=narrative_file,
@@ -94,12 +109,12 @@ def _run_preprocess(
         )
 
     prep = preprocess_dataframe(df_for_preprocess, target=target_for_preprocess, config=config_for_preprocess)
-    out_path = run_dir / "preprocessed.parquet"
+    out_path = effective_run_dir / "preprocessed.parquet"
     write_parquet(prep.transformed, out_path)
 
     if director_build is not None:
-        write_json(run_dir / "director_plan.json", director_build.plan.model_dump(mode="json"))
-        write_jsonl(run_dir / "decision_log.jsonl", director_decision_log)
+        write_json(effective_run_dir / "director_plan.json", director_build.plan.model_dump(mode="json"))
+        write_jsonl(effective_run_dir / "decision_log.jsonl", director_decision_log)
         prep.metadata["director"] = {
             "source": director_build.source,
             "confidence": director_build.plan.confidence,
@@ -108,11 +123,11 @@ def _run_preprocess(
             "narrative_applied": narrative_input.model_dump(mode="json"),
         }
 
-    write_json(run_dir / "preprocess_metadata.json", prep.metadata)
+    write_json(effective_run_dir / "preprocess_metadata.json", prep.metadata)
     write_json(
-        run_dir / "run_manifest.json",
+        effective_run_dir / "preprocess_manifest.json",
         {
-            "run_id": run_id,
+            "run_id": effective_run_id,
             "stage": "preprocess",
             "input": str(data),
             "target": target_for_preprocess,
@@ -124,8 +139,8 @@ def _run_preprocess(
         },
     )
     return {
-        "run_id": run_id,
-        "run_dir": str(run_dir),
+        "run_id": effective_run_id,
+        "run_dir": str(effective_run_dir),
         "output_parquet": str(out_path),
         "target": target_for_preprocess,
     }
@@ -136,25 +151,27 @@ def _run_train(
     target: str,
     config_path: Path | None,
     primary_metric: str | None = None,
+    run_id: str | None = None,
+    run_dir: Path | None = None,
 ) -> dict[str, str]:
     config = load_config(config_path)
     parquet_df = pd.read_parquet(parquet)
     resolved_target = _resolve_target_column(list(parquet_df.columns), target)
 
-    run_id = utc_run_id("train")
-    run_dir = ensure_dir(Path(config.runs_dir) / run_id)
+    effective_run_id = run_id or utc_run_id("train")
+    effective_run_dir = run_dir or ensure_dir(Path(config.runs_dir) / effective_run_id)
 
     tracker = make_tracker(config.tracking)
-    tracker.start_run(run_id, run_dir, params=config.model_dump(mode="json"))
+    tracker.start_run(effective_run_id, effective_run_dir, params=config.model_dump(mode="json"))
 
     summary = train_with_optuna(
         parquet_path=parquet,
         target=resolved_target,
-        run_dir=run_dir,
+        run_dir=effective_run_dir,
         config=config,
         primary_metric_override=primary_metric,
     )
-    write_json(run_dir / "metrics_summary.json", summary)
+    write_json(effective_run_dir / "metrics_summary.json", summary)
     tracker.log_metrics(
         {
             "sample_rows": summary["sample_rows"],
@@ -166,9 +183,9 @@ def _run_train(
     tracker.finish_run()
 
     write_json(
-        run_dir / "run_manifest.json",
+        effective_run_dir / "training_manifest.json",
         {
-            "run_id": run_id,
+            "run_id": effective_run_id,
             "stage": "train",
             "input_parquet": str(parquet),
             "target": resolved_target,
@@ -178,8 +195,8 @@ def _run_train(
         },
     )
     return {
-        "run_id": run_id,
-        "run_dir": str(run_dir),
+        "run_id": effective_run_id,
+        "run_dir": str(effective_run_dir),
         "target": resolved_target,
         "report_path": str(summary.get("report_path", "")),
     }
@@ -229,7 +246,13 @@ def preprocess(
     narrative: str | None = typer.Option(None, "--narrative", help="Optional narrative summary text."),
     use_director: bool = typer.Option(True, "--use-director/--no-director", help="Enable director plan generation and application."),
     approve_low_confidence: bool = typer.Option(False, "--approve-low-confidence", help="Apply director plan even when confidence is below the policy threshold."),
+    run_id: str | None = typer.Option(None, "--run-id", help="Optional run id. Use the same value in `train --run-id` to keep both stages in one directory."),
 ) -> None:
+    resolved_run_dir = None
+    if run_id:
+        config = load_config(config_path)
+        resolved_run_dir = ensure_dir(Path(config.runs_dir) / run_id)
+
     result = _run_preprocess(
         data=data,
         target=target,
@@ -238,6 +261,8 @@ def preprocess(
         narrative=narrative,
         use_director=use_director,
         approve_low_confidence=approve_low_confidence,
+        run_id=run_id,
+        run_dir=resolved_run_dir,
     )
     typer.echo(f"Preprocessed parquet written to {result['output_parquet']}")
 
@@ -276,8 +301,23 @@ def train(
     target: str = typer.Option(..., help="Target column name."),
     config_path: Path | None = typer.Option(None, "--config", help="Optional YAML config path."),
     primary_metric: str | None = typer.Option(None, "--primary-metric", help="Optional override for report primary metric (must match an available evaluation metric)."),
+    run_id: str | None = typer.Option(None, "--run-id", help="Optional run id. If omitted and parquet is runs/*/preprocessed.parquet, output stays in that same run directory."),
 ) -> None:
-    result = _run_train(parquet=parquet, target=target, config_path=config_path, primary_metric=primary_metric)
+    config = load_config(config_path)
+    resolved_run_id, resolved_run_dir, resolution_source = _resolve_train_output_context(
+        parquet=parquet,
+        runs_dir=config.runs_dir,
+        run_id=run_id,
+    )
+    typer.echo(f"Training output context: run_id={resolved_run_id}, run_dir={resolved_run_dir}, source={resolution_source}")
+    result = _run_train(
+        parquet=parquet,
+        target=target,
+        config_path=config_path,
+        primary_metric=primary_metric,
+        run_id=resolved_run_id,
+        run_dir=resolved_run_dir,
+    )
     typer.echo(f"Training run complete. See {result['run_dir']}")
 
 
@@ -293,6 +333,10 @@ def run_full(
     primary_metric: str | None = typer.Option(None, "--primary-metric", help="Optional override for report primary metric (must match an available evaluation metric)."),
 ) -> None:
     typer.echo("[N00] Triggering unified flow: preprocess -> train")
+    config = load_config(config_path)
+    run_id = utc_run_id("run")
+    run_dir = ensure_dir(Path(config.runs_dir) / run_id)
+
     prep_result = _run_preprocess(
         data=data,
         target=target,
@@ -301,6 +345,8 @@ def run_full(
         narrative=narrative,
         use_director=use_director,
         approve_low_confidence=approve_low_confidence,
+        run_id=run_id,
+        run_dir=run_dir,
     )
     typer.echo(f"[N11] Preprocess complete: {prep_result['run_dir']}")
 
@@ -309,6 +355,8 @@ def run_full(
         target=prep_result["target"],
         config_path=config_path,
         primary_metric=primary_metric,
+        run_id=run_id,
+        run_dir=run_dir,
     )
     typer.echo(f"[N18] Training complete: {train_result['run_dir']}")
     if train_result.get("report_path"):

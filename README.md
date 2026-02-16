@@ -37,9 +37,19 @@ Local-first AutoDL scaffolding for wide/sparse tabular data with optional text f
 
 	`autodl preprocess --data data/train.csv --target label --config config.yaml`
 
+	Optional shared run id for preprocess + train:
+
+	`autodl preprocess --data data/train.csv --target label --config config.yaml --run-id run_20260216T120000Z`
+
 5. Run training on preprocessed data:
 
 	`autodl train --parquet runs/<prep_run_id>/preprocessed.parquet --target label --config config.yaml`
+
+	By default, when parquet path is `runs/*/preprocessed.parquet`, training writes into that same run directory.
+
+	You can also force a specific run directory with:
+
+	`autodl train --parquet runs/<prep_run_id>/preprocessed.parquet --target label --config config.yaml --run-id run_20260216T120000Z`
 
 	Optional metric override:
 
@@ -48,6 +58,8 @@ Local-first AutoDL scaffolding for wide/sparse tabular data with optional text f
 Or run the full flow in one command:
 
 	`autodl run-full --data data/train.csv --target label --config config.yaml --narrative-file narrative.yaml`
+
+	This writes preprocess + train artifacts into a single run directory: `runs/run_<timestamp>/`.
 
 	Optional metric override in full flow:
 
@@ -122,7 +134,8 @@ What each choice does:
 - Missing values are imputed during preprocess (numeric median, categorical/text sentinel handling).
 
 ## Run artifact conventions
-- `runs/<run_id>/run_manifest.json`
+- `runs/<run_id>/preprocess_manifest.json` (preprocess stage)
+- `runs/<run_id>/training_manifest.json` (train stage)
 - `runs/<run_id>/profile.json` (profile stage)
 - `runs/<run_id>/preprocessed.parquet` (preprocess stage)
 - `runs/<run_id>/preprocess_metadata.json`
